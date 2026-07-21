@@ -686,11 +686,14 @@ begin
   values (new.id, 'Pedidos', 'pedidos', true, 1000)
   returning id into v_pipeline_id;
 
-  -- Coluna de entrada para leads vindos de anúncios Click-to-WhatsApp (Meta Ads).
-  -- position 500 => fica ANTES de 'Carrinho abandonado' (1000). Ver fn_upsert_wa_contact
-  -- + ingest WAHA (lib/waha/ingest.ts) que auto-cria o lead aqui no first-touch.
+  -- Colunas de entrada: anúncio Click-to-WhatsApp (500, migration 0054) e contato
+  -- comum (750, migration 0055). Ambas ANTES de 'Carrinho abandonado' (1000). O ingest
+  -- WAHA (lib/waha/ingest.ts) auto-cria o lead do first-touch numa delas: novo_meta_ads
+  -- quando há referral de anúncio, senão a etapa aberta de menor position (= novo_contato).
   insert into public.crm_stages (organization_id, pipeline_id, name, slug, position, is_won, is_lost)
-  values (new.id, v_pipeline_id, 'Novo · Meta Ads', 'novo_meta_ads', 500, false, false);
+  values
+    (new.id, v_pipeline_id, 'Novo · Meta Ads', 'novo_meta_ads', 500, false, false),
+    (new.id, v_pipeline_id, 'Novo contato',    'novo_contato',  750, false, false);
 
   for r in
     select * from (values
@@ -6404,3 +6407,23 @@ create index if not exists idx_contacts_acq_channel
 create index if not exists idx_contacts_acq_capi_pending
   on public.contacts (organization_id)
   where (source_metadata #>> '{acquisition,conversions_api,status}') = 'pending';
+
+-- ---- 0055 — etapa de entrada comum 'Novo contato' (migration 0055) ----
+-- Até a 0054 o ingest WAHA só criava lead para contato vindo de anúncio. Com a criação
+-- de lead para TODO contato novo, é preciso uma etapa de entrada comum. A seleção no
+-- código é GENÉRICA (menor position entre as abertas, excluindo novo_meta_ads); esta
+-- etapa em 750 garante que a escolhida seja "Novo contato" e não "Carrinho abandonado".
+-- Idempotente: só insere onde não existe (uniq_crm_stages_pipeline_slug protege).
+insert into public.crm_stages (organization_id, pipeline_id, name, slug, position, is_won, is_lost)
+select p.organization_id, p.id, 'Novo contato', 'novo_contato', 750, false, false
+from public.crm_pipelines p
+where p.is_default = true
+  and not exists (
+    select 1 from public.crm_stages s
+    where s.pipeline_id = p.id and s.slug = 'novo_contato'
+  );
+
+-- Apoio à seleção da etapa de entrada (menor position entre as abertas do pipeline).
+create index if not exists idx_crm_stages_pipeline_open_position
+  on public.crm_stages (pipeline_id, position)
+  where is_archived = false and is_won = false and is_lost = false;

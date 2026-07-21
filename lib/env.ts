@@ -64,6 +64,14 @@ const schema = z.object({
   WAHA_API_BASE_URL: required("WAHA_API_BASE_URL"),
   WAHA_API_KEY: required("WAHA_API_KEY"),
   WAHA_WEBHOOK_BASE_URL: required("WAHA_WEBHOOK_BASE_URL"),
+  /**
+   * Segredo do HMAC dos webhooks WAHA — o MESMO valor que vai em
+   * `WHATSAPP_HOOK_HMAC` no container do WAHA. Opcional por compatibilidade: se
+   * vazio (e a sessão não tiver segredo próprio), o webhook loga um aviso e
+   * aceita sem verificar (modo dev). Em produção DEVE estar preenchida, senão o
+   * endpoint público de webhook fica sem autenticação nenhuma.
+   */
+  WAHA_HMAC_SECRET: z.string().optional().default(""),
 
   // Upstash Redis
   UPSTASH_REDIS_REST_URL: required("UPSTASH_REDIS_REST_URL"),

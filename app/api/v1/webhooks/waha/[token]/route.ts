@@ -15,7 +15,7 @@ import type { NextRequest, NextResponse } from "next/server";
 import { fail, ok } from "@/lib/api/wrappers";
 import { audit } from "@/lib/audit";
 import { createAdminClient } from "@/lib/supabase/admin";
-import { dispatchWahaEvent, verifyHmacSha512, type WahaEnvelope } from "@/lib/waha/ingest";
+import { checkWahaSignature, dispatchWahaEvent, type WahaEnvelope } from "@/lib/waha/ingest";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -57,29 +57,30 @@ export async function POST(req: NextRequest, ctx: RouteCtx): Promise<NextRespons
     return fail("not_found", "unknown webhook token", 404, { requestId });
   }
 
-  // HMAC (best-effort: se fn_decrypt_oauth falhar — ex. seed dev sem cripto —
-  // loga e pula para o MVP).
-  const sigHeader = req.headers.get("x-webhook-hmac") ?? req.headers.get("X-Webhook-Hmac");
-  let validSignature = false;
-  let hmacSkipped = false;
-  try {
-    const dec = await admin.rpc("fn_decrypt_oauth", {
-      ciphertext: session.webhook_secret_encrypted,
-    });
-    if (dec.error || !dec.data) {
-      hmacSkipped = true;
-    } else {
-      validSignature = verifyHmacSha512(rawBody, sigHeader, dec.data as string);
-    }
-  } catch {
-    hmacSkipped = true;
-  }
+  // HMAC — segredo por sessão, senão WAHA_HMAC_SECRET do ambiente. Só pula quando
+  // não há segredo em lugar nenhum (dev); checkWahaSignature avisa no log nesse caso.
+  const sigHeader = req.headers.get("x-webhook-hmac");
+  const hmac = await checkWahaSignature(
+    admin,
+    session.webhook_secret_encrypted,
+    rawBody,
+    sigHeader,
+  );
+  const hmacSkipped = hmac.mode === "skipped_no_secret";
+  const validSignature = hmac.mode === "verified" && hmac.ok;
 
-  if (!hmacSkipped && !validSignature) {
+  if (!hmac.ok) {
     await audit({
       action: "nuvemshop.webhook_invalid_signature",
       organizationId: session.organization_id,
-      metadata: { provider: "waha", session: session.waha_session_name, event: envelope.event },
+      metadata: {
+        provider: "waha",
+        session: session.waha_session_name,
+        event: envelope.event,
+        // Nunca logar o segredo nem a assinatura inteira.
+        signature_present: !!sigHeader,
+        signature_len: sigHeader?.length ?? 0,
+      },
     });
     return fail("unauthenticated", "invalid_signature", 401, { requestId });
   }

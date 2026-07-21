@@ -9,13 +9,13 @@
  * emite `message` E `message.any` para a mesma mensagem (corrida). Ver migration
  * 0027 para o modelo de identidade canônica.
  */
-import { createHmac, timingSafeEqual } from "node:crypto";
-
 import { createLeadHandler } from "@/app/api/v1/leads/_handler";
 import { audit } from "@/lib/audit";
 import type { createAdminClient } from "@/lib/supabase/admin";
 import { ackToStatus } from "@/lib/types/messaging";
 import { type Acquisition, parseMetaAdReferral } from "@/lib/waha/ad-referral";
+import { type EntryStageCandidate, pickEntryStage } from "@/lib/waha/entry-stage";
+import { verifyHmacSha512 } from "@/lib/waha/hmac";
 
 type Admin = ReturnType<typeof createAdminClient>;
 
@@ -79,20 +79,65 @@ export function parseChatId(chatId: string): ChatIdentity {
 
 const STOP_RX = /\b(STOP|PARAR|SAIR|UNSUBSCRIBE)\b/i;
 
-export function verifyHmacSha512(
+// Reexportado p/ compatibilidade: a implementação vive em lib/waha/hmac.ts (pura,
+// testável sem a cadeia de env). Ver checkWahaSignature logo abaixo.
+export { verifyHmacSha512 };
+
+export type HmacMode = "verified" | "skipped_no_secret";
+export interface HmacCheck {
+  /** false só quando HÁ segredo configurado e a assinatura não bate. */
+  ok: boolean;
+  mode: HmacMode;
+}
+
+/**
+ * Resolve o segredo do HMAC e verifica a assinatura do webhook WAHA.
+ *
+ * Precedência: segredo POR SESSÃO (channel_sessions.webhook_secret_encrypted,
+ * usado no modelo per-tenant) > `WAHA_HMAC_SECRET` do ambiente (o mesmo valor
+ * de WHATSAPP_HOOK_HMAC no container do WAHA, modelo de instância única).
+ *
+ * Antes da correção, a linha da sessão nascia com um placeholder de 1 byte
+ * (`Buffer.from([0])` no onboarding) e o env NUNCA era lido — então a validação
+ * era pulada SEMPRE e o endpoint público aceitava qualquer corpo. Agora só se
+ * pula quando não existe segredo em lugar nenhum (dev), e isso vira log de aviso.
+ *
+ * O segredo em si nunca é logado — só o modo e o tamanho da assinatura recebida.
+ */
+export async function checkWahaSignature(
+  admin: Admin,
+  sessionSecretCiphertext: unknown,
   rawBody: string,
   signatureHeader: string | null,
-  secret: string,
-): boolean {
-  if (!signatureHeader) return false;
-  const expected = createHmac("sha512", secret).update(rawBody, "utf8").digest("hex");
-  const got = signatureHeader.replace(/^sha512=/i, "").trim();
-  if (got.length !== expected.length) return false;
+): Promise<HmacCheck> {
+  let secret = "";
+
   try {
-    return timingSafeEqual(Buffer.from(got, "hex"), Buffer.from(expected, "hex"));
+    const dec = await admin.rpc("fn_decrypt_oauth" as never, {
+      ciphertext: sessionSecretCiphertext,
+    } as never);
+    if (!dec.error && typeof dec.data === "string" && dec.data.length >= 4) {
+      secret = dec.data;
+    }
   } catch {
-    return false;
+    // Segredo por sessão indisponível (placeholder / cripto ausente) — cai no env.
   }
+
+  if (!secret) {
+    const fromEnv = process.env.WAHA_HMAC_SECRET ?? "";
+    if (fromEnv.length >= 4) secret = fromEnv;
+  }
+
+  if (!secret) {
+    console.warn(
+      "[waha.webhook] HMAC não verificado: nenhum segredo configurado " +
+        "(defina WAHA_HMAC_SECRET no app e WHATSAPP_HOOK_HMAC no WAHA). " +
+        "O endpoint está aceitando webhooks sem autenticação.",
+    );
+    return { ok: true, mode: "skipped_no_secret" };
+  }
+
+  return { ok: verifyHmacSha512(rawBody, signatureHeader, secret), mode: "verified" };
 }
 
 function previewFromMessage(p: WahaPayload): string {
@@ -194,37 +239,106 @@ async function captureAcquisition(
 }
 
 /**
- * Auto-cria um lead na coluna de entrada 'novo_meta_ads' do pipeline default
- * quando um contato NOVO chega via anúncio. Tolerante: se o org não tiver a
- * coluna (pipeline custom / backfill não rodou) ou algo falhar, apenas loga e
- * segue — nunca quebra a ingestão da mensagem. Idempotência do lead via
- * uniq_crm_leads_org_source_external (source='meta_ads', external_id=click_id).
+ * Lê a aquisição JÁ persistida no contato. Necessário porque o lead pode nascer
+ * numa mensagem posterior à que capturou a origem (ou no evento gêmeo da corrida
+ * message/message.any) — sem isso um contato de anúncio cairia na etapa comum.
  */
-async function createAdOriginLead(
+async function storedAcquisition(
+  admin: Admin,
+  orgId: string,
+  contactId: string,
+): Promise<Acquisition | null> {
+  const { data } = await admin
+    .from("contacts")
+    .select("source_metadata")
+    .eq("organization_id", orgId)
+    .eq("id", contactId)
+    .maybeSingle();
+  const acq = (data?.source_metadata as { acquisition?: unknown } | null)?.acquisition;
+  return acq && typeof acq === "object" ? (acq as Acquisition) : null;
+}
+
+/**
+ * Resolve a etapa de entrada do pipeline default.
+ *  - anúncio  => coluna dedicada 'novo_meta_ads' (0054);
+ *  - comum    => etapa ABERTA de menor `position`, excluindo 'novo_meta_ads'
+ *                (0055 garante que seja 'Novo contato' no pipeline default).
+ * Sem slug hardcoded no caminho comum: pipeline custom cai na sua própria
+ * primeira etapa aberta. Anúncio sem a coluna dedicada faz fallback p/ a comum.
+ */
+async function resolveEntryStage(
+  admin: Admin,
+  pipelineId: string,
+  isAdOrigin: boolean,
+): Promise<string | null> {
+  const { data } = await admin
+    .from("crm_stages")
+    .select("id, slug, position, is_archived, is_won, is_lost")
+    .eq("pipeline_id", pipelineId)
+    .eq("is_archived", false)
+    .order("position", { ascending: true });
+  return pickEntryStage((data ?? []) as unknown as EntryStageCandidate[], isAdOrigin);
+}
+
+/**
+ * Garante EXATAMENTE um lead aberto para o contato (Correção 2).
+ *
+ * Idempotência é por código, não por constraint: `crm_leads` modela Pedido
+ * (status open/won/lost) e cliente recorrente tem vários leads legítimos ao
+ * longo do tempo — uma unique por contato quebraria recompra. Aqui: se já há
+ * lead `status='open'`, não cria outro e NUNCA move o existente.
+ *
+ * Chamado DEPOIS do insert da mensagem justamente para herdar o portão atômico
+ * de `unique (organization_id, external_id)`: o WAHA emite `message` E
+ * `message.any` p/ a mesma mensagem, e um check-then-act aqui duplicaria lead.
+ *
+ * Tolerante: qualquer falha vira log — nunca quebra a ingestão da mensagem.
+ */
+async function ensureLeadForContact(
   admin: Admin,
   session: Session,
   contactId: string,
-  acq: Acquisition,
+  freshAcquisition: Acquisition | null,
   title: string,
   requestId: string,
 ): Promise<void> {
   try {
+    const { data: openLead } = await admin
+      .from("crm_leads")
+      .select("id")
+      .eq("organization_id", session.organization_id)
+      .eq("contact_id", contactId)
+      .eq("status", "open")
+      .limit(1)
+      .maybeSingle();
+    if (openLead) return; // já tem lead ativo => nada a fazer, e não move
+
     const { data: pipeline } = await admin
       .from("crm_pipelines")
       .select("id")
       .eq("organization_id", session.organization_id)
       .eq("is_default", true)
-      .maybeSingle();
-    if (!pipeline) return;
-
-    const { data: stage } = await admin
-      .from("crm_stages")
-      .select("id")
-      .eq("pipeline_id", pipeline.id)
-      .eq("slug", "novo_meta_ads")
       .eq("is_archived", false)
       .maybeSingle();
-    if (!stage) return; // org sem a coluna de entrada => só captura origem no contato
+    if (!pipeline) {
+      console.error(
+        "[waha.ingest] ensureLeadForContact: org sem pipeline default",
+        session.organization_id,
+      );
+      return;
+    }
+
+    // Origem desta mensagem (first-touch recém-capturado) ou a já persistida.
+    const acq = freshAcquisition ?? (await storedAcquisition(admin, session.organization_id, contactId));
+
+    const stageId = await resolveEntryStage(admin, pipeline.id as string, !!acq);
+    if (!stageId) {
+      console.error(
+        "[waha.ingest] ensureLeadForContact: pipeline sem etapa aberta",
+        pipeline.id,
+      );
+      return;
+    }
 
     await createLeadHandler(
       admin,
@@ -235,19 +349,24 @@ async function createAdOriginLead(
       },
       {
         pipeline_id: pipeline.id,
-        stage_id: stage.id,
+        stage_id: stageId,
         title,
         contact_id: contactId,
-        source: acq.channel,
-        source_metadata: { acquisition: acq as unknown as Record<string, unknown> },
-        external_id: acq.click_id ?? contactId,
+        source: acq ? acq.channel : "whatsapp",
+        source_metadata: acq
+          ? { acquisition: acq as unknown as Record<string, unknown> }
+          : {},
+        // external_id só p/ anúncio: alimenta uniq_crm_leads_org_source_external.
+        // Lead comum fica null de propósito — com contact_id ali, a unique
+        // bloquearia a recompra legítima do mesmo cliente.
+        external_id: acq ? (acq.click_id ?? contactId) : null,
         tags: [],
         currency: "BRL",
       } as Parameters<typeof createLeadHandler>[2],
     );
   } catch (err) {
     console.error(
-      "[waha.ingest] createAdOriginLead failed",
+      "[waha.ingest] ensureLeadForContact failed",
       err instanceof Error ? err.message : String(err),
     );
   }
@@ -310,18 +429,14 @@ async function handleInbound(
 
   // Origem Click-to-WhatsApp (Meta Ads): captura só p/ contato NOVO (first-touch)
   // e sem quebrar o fluxo se o referral vier ausente/inesperado (parser tolerante).
+  // A gravação é atômica no banco (só escreve se ainda não há 'acquisition'), então
+  // o evento gêmeo message/message.any não sobrescreve. O LEAD nasce mais abaixo,
+  // depois do portão de idempotência da mensagem — ver ensureLeadForContact.
+  let acquisition: Acquisition | null = null;
   if (wasInserted) {
-    const acquisition = parseMetaAdReferral(p);
+    acquisition = parseMetaAdReferral(p);
     if (acquisition) {
       await captureAcquisition(admin, session.organization_id, contactId, acquisition);
-      await createAdOriginLead(
-        admin,
-        session,
-        contactId,
-        acquisition,
-        notifyName ?? (parsed.kind === "phone" ? parsed.phone : chatId) ?? "Lead Meta Ads",
-        requestId,
-      );
     }
   }
 
@@ -360,6 +475,19 @@ async function handleInbound(
   if (insertErr?.code === "23505") return;
 
   await markConversation(admin, conversationId, "inbound", previewFromMessage(p), now);
+
+  // Lead do funil: exatamente um aberto por contato, para TODO contato (anúncio ou
+  // comum). Fica aqui de propósito — depois do 23505 da mensagem, que é o único
+  // portão atômico que garante que só UM dos eventos gêmeos (message/message.any)
+  // chegue até aqui. Antes disso, o check-then-act de "já existe lead?" duplicaria.
+  await ensureLeadForContact(
+    admin,
+    session,
+    contactId,
+    acquisition,
+    notifyName ?? (parsed.kind === "phone" ? parsed.phone : chatId) ?? "Contato WhatsApp",
+    requestId,
+  );
 
   if (p.body && STOP_RX.test(p.body)) {
     await admin
