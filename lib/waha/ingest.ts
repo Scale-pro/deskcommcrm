@@ -11,9 +11,11 @@
  */
 import { createHmac, timingSafeEqual } from "node:crypto";
 
+import { createLeadHandler } from "@/app/api/v1/leads/_handler";
 import { audit } from "@/lib/audit";
 import type { createAdminClient } from "@/lib/supabase/admin";
 import { ackToStatus } from "@/lib/types/messaging";
+import { type Acquisition, parseMetaAdReferral } from "@/lib/waha/ad-referral";
 
 type Admin = ReturnType<typeof createAdminClient>;
 
@@ -42,6 +44,8 @@ export interface WahaPayload {
     notifyName?: string;
     pushName?: string;
   } & Record<string, unknown>;
+  /** Objeto de referral de anúncio Click-to-WhatsApp — shape varia por engine WAHA. */
+  referral?: unknown;
 }
 
 export interface WahaEnvelope {
@@ -130,9 +134,16 @@ function notifyNameOf(p: WahaPayload): string | null {
   return p._data?.notifyName ?? p._data?.pushName ?? null;
 }
 
+interface UpsertContactResult {
+  contactId: string;
+  wasInserted: boolean;
+}
+
 /**
  * Upsert atômico de contato pela identidade canônica. Retorna null se a
- * identidade for de grupo ou a RPC falhar.
+ * identidade for de grupo ou a RPC falhar. `wasInserted` distingue contato NOVO
+ * (first-touch) de reencontro — usado p/ capturar origem e auto-criar lead só
+ * na primeira aparição. A RPC agora retorna tabela (contact_id, was_inserted).
  */
 async function upsertContact(
   admin: Admin,
@@ -140,7 +151,7 @@ async function upsertContact(
   parsed: ChatIdentity,
   chatId: string,
   notifyName: string | null,
-): Promise<string | null> {
+): Promise<UpsertContactResult | null> {
   if (parsed.kind === "group") return null;
   const { data, error } = await admin.rpc("fn_upsert_wa_contact" as never, {
     p_org: orgId,
@@ -154,7 +165,92 @@ async function upsertContact(
     console.error("[waha.ingest] fn_upsert_wa_contact failed", error.message);
     return null;
   }
-  return (data as string) ?? null;
+  // Função retorna SETOF: supabase-js entrega array de linhas.
+  const row = (Array.isArray(data) ? data[0] : data) as
+    | { contact_id?: string; was_inserted?: boolean }
+    | null
+    | undefined;
+  if (!row?.contact_id) return null;
+  return { contactId: row.contact_id, wasInserted: row.was_inserted === true };
+}
+
+/**
+ * Grava a origem de aquisição no contato (first-touch, atômico, nunca sobrescreve).
+ * Só chamado p/ contato recém-criado com origem de anúncio detectada.
+ */
+async function captureAcquisition(
+  admin: Admin,
+  orgId: string,
+  contactId: string,
+  acq: Acquisition,
+): Promise<void> {
+  const { error } = await admin.rpc("fn_capture_contact_acquisition" as never, {
+    p_contact: contactId,
+    p_org: orgId,
+    p_channel: acq.channel,
+    p_acquisition: acq as unknown as Record<string, unknown>,
+  } as never);
+  if (error) console.error("[waha.ingest] fn_capture_contact_acquisition failed", error.message);
+}
+
+/**
+ * Auto-cria um lead na coluna de entrada 'novo_meta_ads' do pipeline default
+ * quando um contato NOVO chega via anúncio. Tolerante: se o org não tiver a
+ * coluna (pipeline custom / backfill não rodou) ou algo falhar, apenas loga e
+ * segue — nunca quebra a ingestão da mensagem. Idempotência do lead via
+ * uniq_crm_leads_org_source_external (source='meta_ads', external_id=click_id).
+ */
+async function createAdOriginLead(
+  admin: Admin,
+  session: Session,
+  contactId: string,
+  acq: Acquisition,
+  title: string,
+  requestId: string,
+): Promise<void> {
+  try {
+    const { data: pipeline } = await admin
+      .from("crm_pipelines")
+      .select("id")
+      .eq("organization_id", session.organization_id)
+      .eq("is_default", true)
+      .maybeSingle();
+    if (!pipeline) return;
+
+    const { data: stage } = await admin
+      .from("crm_stages")
+      .select("id")
+      .eq("pipeline_id", pipeline.id)
+      .eq("slug", "novo_meta_ads")
+      .eq("is_archived", false)
+      .maybeSingle();
+    if (!stage) return; // org sem a coluna de entrada => só captura origem no contato
+
+    await createLeadHandler(
+      admin,
+      {
+        organization_id: session.organization_id,
+        actor: { type: "webhook_source", id: session.id },
+        requestId,
+      },
+      {
+        pipeline_id: pipeline.id,
+        stage_id: stage.id,
+        title,
+        contact_id: contactId,
+        source: acq.channel,
+        source_metadata: { acquisition: acq as unknown as Record<string, unknown> },
+        external_id: acq.click_id ?? contactId,
+        tags: [],
+        currency: "BRL",
+      } as Parameters<typeof createLeadHandler>[2],
+    );
+  } catch (err) {
+    console.error(
+      "[waha.ingest] createAdOriginLead failed",
+      err instanceof Error ? err.message : String(err),
+    );
+  }
 }
 
 async function upsertConversation(
@@ -207,8 +303,28 @@ async function handleInbound(
   // WAHA emite eventos vazios p/ status/read-receipt/presence — não viram mensagem.
   if (!p.body && !p.mediaUrl && !p.hasMedia) return;
 
-  const contactId = await upsertContact(admin, session.organization_id, parsed, chatId, notifyNameOf(p));
-  if (!contactId) return;
+  const notifyName = notifyNameOf(p);
+  const upserted = await upsertContact(admin, session.organization_id, parsed, chatId, notifyName);
+  if (!upserted) return;
+  const { contactId, wasInserted } = upserted;
+
+  // Origem Click-to-WhatsApp (Meta Ads): captura só p/ contato NOVO (first-touch)
+  // e sem quebrar o fluxo se o referral vier ausente/inesperado (parser tolerante).
+  if (wasInserted) {
+    const acquisition = parseMetaAdReferral(p);
+    if (acquisition) {
+      await captureAcquisition(admin, session.organization_id, contactId, acquisition);
+      await createAdOriginLead(
+        admin,
+        session,
+        contactId,
+        acquisition,
+        notifyName ?? (parsed.kind === "phone" ? parsed.phone : chatId) ?? "Lead Meta Ads",
+        requestId,
+      );
+    }
+  }
+
   const conversationId = await upsertConversation(admin, session.organization_id, contactId, session.id);
   if (!conversationId) return;
 
@@ -326,8 +442,11 @@ async function handleOutboundFromUserPhone(
   if (!p.id || !chatId) return;
   if (!p.body && !p.mediaUrl && !p.hasMedia) return;
 
-  const contactId = await upsertContact(admin, session.organization_id, parsed, chatId, notifyNameOf(p));
-  if (!contactId) return;
+  // Outbound (operador respondeu pelo celular): sem captura de origem — a origem de
+  // anúncio é first-touch do INBOUND. Só adapta o novo retorno da RPC.
+  const upserted = await upsertContact(admin, session.organization_id, parsed, chatId, notifyNameOf(p));
+  if (!upserted) return;
+  const contactId = upserted.contactId;
   const conversationId = await upsertConversation(admin, session.organization_id, contactId, session.id);
   if (!conversationId) return;
 

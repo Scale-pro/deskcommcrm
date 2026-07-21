@@ -686,6 +686,12 @@ begin
   values (new.id, 'Pedidos', 'pedidos', true, 1000)
   returning id into v_pipeline_id;
 
+  -- Coluna de entrada para leads vindos de anúncios Click-to-WhatsApp (Meta Ads).
+  -- position 500 => fica ANTES de 'Carrinho abandonado' (1000). Ver fn_upsert_wa_contact
+  -- + ingest WAHA (lib/waha/ingest.ts) que auto-cria o lead aqui no first-touch.
+  insert into public.crm_stages (organization_id, pipeline_id, name, slug, position, is_won, is_lost)
+  values (new.id, v_pipeline_id, 'Novo · Meta Ads', 'novo_meta_ads', 500, false, false);
+
   for r in
     select * from (values
       ('Carrinho abandonado',  'carrinho_abandonado',  false, false),
@@ -4153,11 +4159,17 @@ create unique index if not exists uniq_conversations_1to1_per_contact_session
   where is_group = false;
 
 -- D. Upsert atômico (a aplicação usa via lib/waha/ingest.ts)
+-- 0054: assinatura (args) inalterada — só o RETURN passa de uuid p/ tabela
+-- (contact_id, was_inserted), então os grants/revokes por assinatura seguem válidos.
+-- was_inserted (xmax = 0) distingue insert de update no upsert: o ingest usa isso
+-- para capturar origem de anúncio (first-touch) e auto-criar lead só p/ contato NOVO.
+drop function if exists public.fn_upsert_wa_contact(uuid, text, text, text, text, text);
 create or replace function public.fn_upsert_wa_contact(
   p_org uuid, p_kind text, p_phone text, p_lid text, p_chat_id text, p_notify text
-) returns uuid language plpgsql security definer set search_path = public as $$
-declare v_id uuid;
+) returns table (contact_id uuid, was_inserted boolean)
+language plpgsql security definer set search_path = public as $$
 begin
+  return query
   insert into public.contacts (organization_id, phone_number, source, consent, tags, source_metadata, display_name)
   values (p_org, case when p_kind = 'phone' then p_phone end, 'whatsapp', '{}'::jsonb, '{}'::text[],
     case when p_kind = 'lid' then jsonb_build_object('waha_lid', p_lid, 'notify_name', nullif(p_notify, ''))
@@ -4165,8 +4177,7 @@ begin
     nullif(p_notify, ''))
   on conflict (organization_id, wa_identity) where wa_identity is not null and is_merged_into is null
   do update set display_name = coalesce(contacts.display_name, excluded.display_name), updated_at = now()
-  returning id into v_id;
-  return v_id;
+  returning contacts.id, (xmax = 0);
 end; $$;
 
 create or replace function public.fn_upsert_wa_conversation(
@@ -6344,3 +6355,52 @@ alter table flywheel_distiller_proposals
   add column if not exists applied_at timestamptz,
   add column if not exists applied_version_id uuid references ai_agent_versions(id) on delete set null,
   add column if not exists applied_by uuid;
+
+-- ============================================================================
+-- 0054 — Rastreamento de origem de aquisição (Parte 1: Meta Ads / Click-to-WhatsApp)
+-- Schema de source_metadata.acquisition AGNÓSTICO DE CANAL (discriminador `channel`:
+-- meta_ads hoje; google_ads/outros no mesmo shape depois). "Não Rastreada" = ausência
+-- da chave `acquisition`. A coluna 'novo_meta_ads' e fn_upsert_wa_contact (retorno
+-- was_inserted) já constam no corpo do baseline acima; aqui vai o auto-curativo:
+-- backfill da coluna, fn_capture_contact_acquisition e índices. Idempotente.
+-- ============================================================================
+
+-- Backfill: adiciona 'novo_meta_ads' a pipelines default existentes que não a têm.
+insert into public.crm_stages (organization_id, pipeline_id, name, slug, position, is_won, is_lost)
+select p.organization_id, p.id, 'Novo · Meta Ads', 'novo_meta_ads', 500, false, false
+from public.crm_pipelines p
+where p.is_default = true
+  and not exists (
+    select 1 from public.crm_stages s
+    where s.pipeline_id = p.id and s.slug = 'novo_meta_ads'
+  );
+
+-- Gravação atômica e first-touch da origem de aquisição (nunca sobrescreve).
+create or replace function public.fn_capture_contact_acquisition(
+  p_contact uuid, p_org uuid, p_channel text, p_acquisition jsonb
+) returns boolean language plpgsql security definer set search_path = public as $$
+declare v_updated boolean := false;
+begin
+  update public.contacts
+     set source = p_channel,
+         source_metadata = source_metadata || jsonb_build_object('acquisition', p_acquisition),
+         updated_at = now()
+   where id = p_contact
+     and organization_id = p_org
+     and not (source_metadata ? 'acquisition')
+   returning true into v_updated;
+  return coalesce(v_updated, false);
+end; $$;
+
+revoke all on function public.fn_capture_contact_acquisition(uuid, uuid, text, jsonb) from public;
+revoke execute on function public.fn_capture_contact_acquisition(uuid, uuid, text, jsonb) from anon;
+grant execute on function public.fn_capture_contact_acquisition(uuid, uuid, text, jsonb) to service_role;
+
+-- Índices: dashboard "Origem das Conversas" (por canal) + fila do Conversions API.
+create index if not exists idx_contacts_acq_channel
+  on public.contacts (organization_id, (source_metadata #>> '{acquisition,channel}'))
+  where source_metadata ? 'acquisition';
+
+create index if not exists idx_contacts_acq_capi_pending
+  on public.contacts (organization_id)
+  where (source_metadata #>> '{acquisition,conversions_api,status}') = 'pending';

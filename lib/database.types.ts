@@ -4480,6 +4480,15 @@ export type Database = {
         Args: { p_min: string; p_org: string }
         Returns: boolean
       }
+      fn_capture_contact_acquisition: {
+        Args: {
+          p_acquisition: Json
+          p_channel: string
+          p_contact: string
+          p_org: string
+        }
+        Returns: boolean
+      }
       fn_upsert_wa_contact: {
         Args: {
           p_chat_id: string
@@ -4489,7 +4498,10 @@ export type Database = {
           p_org: string
           p_phone: string
         }
-        Returns: string
+        Returns: {
+          contact_id: string
+          was_inserted: boolean
+        }[]
       }
       fn_upsert_wa_conversation: {
         Args: { p_contact: string; p_org: string; p_session: string }
